@@ -1,0 +1,7 @@
+set 1 2-0-1000  so far the best
+set 2  adaptive_in_reward
+set 3  adaptive_in_sac_alpha
+set 4  SAC
+
+speed adaptive_in_sac_alpha>2-0-1000 >adaptive_in_reward
+reward adaptive_in_sac_alpha=2-0-1000 =adaptive_in_reward
