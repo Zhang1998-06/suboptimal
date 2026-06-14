@@ -1,0 +1,293 @@
+﻿import numpy as np
+from collections import defaultdict
+from itertools import count
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.autograd as autograd
+from utils.replay_memory import ReplayMemory
+from utils import plotting
+from agents.hdqn_mdp import *  # Make sure HSAC or your agent is imported here
+
+USE_CUDA = torch.cuda.is_available()
+dtype = torch.cuda.FloatTensor if torch.cuda.is_available() else torch.FloatTensor
+device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+
+
+class Variable(autograd.Variable):
+    def __init__(self, data, *args, **kwargs):
+        if USE_CUDA:
+            data = data.cuda()
+        super(Variable, self).__init__(data, *args, **kwargs)
+
+
+def get_action_index(action):
+    actions = [
+        (-1.0, -np.pi / 50),   # action 0
+        (-1.0, 0.0),           # action 1
+        (-1.0, np.pi / 50),    # action 2  right lane
+        (0.0, -np.pi / 50),    # action 3
+        (0.0, 0.0),            # action 4
+        (0.0, np.pi / 50),     # action 5  right lane
+        (1.0, -np.pi / 50),    # action 6
+        (1.0, 0.0),            # action 7
+        (1.0, np.pi / 50)      # action 8  right lane
+    ]
+    try:
+        return actions.index(action)
+    except ValueError:
+        return "Action not found in the action space."
+
+
+def stochastic_multi_actions(action_indices, N=9, theta=0.2):
+    """
+    Creates a stochastic distribution over N actions, giving higher probability
+    to action_indices and distributing a smaller mass among other actions.
+    """
+    if len(action_indices) == N:
+        dist = torch.full((N,), 1.0 / N)
+    else:
+        dist = torch.full((N,), theta / (N - len(action_indices)))
+        for action in action_indices:
+            dist[action] = 1 - theta / len(action_indices)
+        dist /= dist.sum()
+    return dist
+
+
+##############################
+#  Discriminator and GAIL   #
+##############################
+class Discriminator(nn.Module):
+    def __init__(self, state_dim, hidden_dim, action_dim):
+        super(Discriminator, self).__init__()
+        self.fc1 = nn.Linear(state_dim + action_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, 1)
+
+    def forward(self, x, a):
+        # x: [batch, state_dim], a: [batch, action_dim one-hot]
+        cat = torch.cat([x, a], dim=1)
+        x = F.relu(self.fc1(cat))
+        return torch.sigmoid(self.fc2(x))
+
+
+class GAIL:
+    def __init__(self, agent, state_dim, action_dim, hidden_dim=256, lr_d=1e-3, device=device):
+        """
+        :param agent: the RL agent (e.g. HSAC) we want to train
+        :param state_dim: dimension of states (including any appended lat/road bits)
+        :param action_dim: dimension of possible discrete actions (9 in your setup)
+        :param hidden_dim: size of hidden layer in discriminator
+        :param lr_d: learning rate for discriminator
+        """
+        self.discriminator = Discriminator(state_dim, hidden_dim, action_dim).to(device)
+        self.discriminator_optimizer = torch.optim.Adam(
+            self.discriminator.parameters(), lr=lr_d
+        )
+        self.agent = agent
+        self.device = device
+
+    def learn(self, expert_s, expert_a, agent_s, agent_a, agent_next_s, agent_done):
+        """
+        1) Update the discriminator by classifying 'expert' vs 'agent' transitions.
+        2) Use -log(D(agent)) as the reward for the agent.
+        3) Feed the shaped transitions back into the agent to update its policy/Qs.
+        """
+        # Convert to torch
+        expert_states = torch.tensor(expert_s, dtype=torch.float).to(self.device)
+        expert_actions = torch.tensor(expert_a).to(self.device)  # shape [B]
+        agent_states = torch.tensor(agent_s, dtype=torch.float).to(self.device)
+        agent_actions = torch.tensor(agent_a).to(self.device)    # shape [B]
+
+        # One-hot the discrete actions for the discriminator
+        num_actions = self.agent.action_dim
+        expert_actions = F.one_hot(expert_actions, num_classes=num_actions).float()
+        agent_actions  = F.one_hot(agent_actions,  num_classes=num_actions).float()
+
+        # Forward pass: Discriminator tries to classify
+        # agent transitions as 1, expert transitions as 0
+        agent_prob = self.discriminator(agent_states, agent_actions)
+        expert_prob = self.discriminator(expert_states, expert_actions)
+
+        # Discriminator loss: Cross-entropy
+        # We label agent transitions with 1, expert transitions with 0.
+        d_loss = (
+            nn.BCELoss()(agent_prob, torch.ones_like(agent_prob)) +
+            nn.BCELoss()(expert_prob, torch.zeros_like(expert_prob))
+        )
+        self.discriminator_optimizer.zero_grad()
+        d_loss.backward()
+        self.discriminator_optimizer.step()
+
+        # Shaped rewards = -log(D(agent)), encourage agent to fool the discriminator
+        shaped_rewards = -torch.log(agent_prob + 1e-8).detach().cpu().numpy()
+        shaped_rewards = np.squeeze(shaped_rewards, axis=1)
+        # Pack shaped transitions into dictionary
+        transition_dict = {
+            'states': agent_s,
+            'actions': agent_a,
+            'rewards': shaped_rewards,      # GAIL reward
+            'next_states': agent_next_s,
+            'dones': agent_done
+        }
+
+        # Use shaped transitions to update the RL agent
+        self.agent.update_controller(transition_dict)
+
+
+####################################
+#        Main HDQN + GAIL Loop     #
+####################################
+def hdqn_learning(env, agent, num_episodes):
+    """
+    HDQN learning algorithm integrated with GAIL:
+      1) Load offline 'rule_based_trajectories' into expert_data
+      2) Construct GAIL to discriminate expert vs. agent transitions
+      3) Train HSAC with GAIL reward shaping
+    """
+    import pickle
+
+    # 1) Prepare offline expert transitions
+    expert_data = ReplayMemory(50000)
+    with open("rule_based_trajectories.pkl", "rb") as f:
+        trajectories = pickle.load(f)
+
+    for t in trajectories:
+        state      = t["state"]
+        action     = t["action"]
+        next_state = t["next_state"]
+        reward     = t["reward"]
+        done       = t["done"]
+        expert_data.push(state, action, next_state, reward, done)
+
+    # 2) Build GAIL object
+    #    We'll use agent.state_dim and agent.action_dim from the HSAC definition
+    gail = GAIL(
+        agent       = agent,
+        state_dim   = agent.state_dim,
+        action_dim  = agent.action_dim,
+        hidden_dim  = 256,    # Tweak as needed
+        lr_d        = 1e-3,
+        device      = device
+    )
+
+    batch_size = agent.batch_size
+    check_frequence = 5
+
+    stats = plotting.EpisodeStats(
+        episode_lengths=np.zeros(num_episodes),
+        episode_rewards=np.zeros(num_episodes),
+        crash_times=np.zeros(num_episodes),
+        trap=np.zeros(num_episodes),
+        average_speed=np.zeros(num_episodes),
+        distance=np.zeros(num_episodes),
+        episode_low_level_reward=np.zeros(num_episodes),
+        goal_reached_times=np.zeros(num_episodes),
+    )
+
+    n_thousand_episode = int(np.floor(num_episodes / check_frequence))
+    total_timestep = 0
+    overall_episode = 0
+    intrinsic_thousand_reward_totall = []
+    extrinsic_thousand_reward_totall = []
+    best_episode = 0
+    best_reward = -999999.0
+
+    # Main training loop
+    for i_thousand_episode in range(n_thousand_episode):
+        goal_reached_times = 0
+        check_extrinsic_reward = 0
+
+        for i_episode in range(check_frequence):
+            overall_episode += 1
+            episode_length = 0
+            current_state, _ = env.reset()  # if your env.reset() returns a tuple
+            totalspeed = 0
+            current_state = current_state.reshape(-1)
+            done = False
+
+            while not done:
+                current_state = current_state.reshape(-1)
+                total_timestep += 1
+                episode_length += 1
+
+                # Combine state with lat_center and on_road
+                joint_state_goal = np.concatenate(
+                    [current_state, [env.lat_center()], [env.vehicle.on_road]]
+                )
+
+                # HSAC selects an action
+                action, agent_probs = agent.select_action(joint_state_goal)
+
+                # Step environment
+                next_state, env_reward, done, _ = env.step(action)
+                totalspeed += env.egovehiclespeed()
+
+                # For stats
+                idx = i_thousand_episode * check_frequence + i_episode
+                stats.episode_rewards[idx] += env_reward
+                stats.episode_low_level_reward[idx] += env_reward
+                stats.episode_lengths[idx] = episode_length
+
+                goal_reached = 0
+                stats.goal_reached_times[idx] += goal_reached
+                goal_reached_times += goal_reached
+
+                next_state = next_state.reshape(-1)
+                joint_next_state_goal = np.concatenate(
+                    [next_state, [env.lat_center()], [env.vehicle.on_road]]
+                )
+
+                # Put (s, a, r, s') in agent replay
+                agent.replay_memory.push(
+                    joint_state_goal,
+                    action,
+                    joint_next_state_goal,
+                    env_reward,  # using the environment reward (for logging if needed)
+                    done
+                )
+
+                check_extrinsic_reward += env_reward
+
+                # Possibly update agent if enough data is in the buffer
+                if len(agent.replay_memory) >= batch_size:
+                    # Sample from agent replay
+                    agent_s, agent_a, agent_ns, agent_r, agent_d = agent.replay_memory.sample(batch_size)
+
+                    # Sample from expert data
+                    if len(expert_data) >= batch_size:
+                        expert_s, expert_a, expert_ns, expert_r, expert_d = expert_data.sample(batch_size)
+
+                        # Run one GAIL update step
+                        gail.learn(
+                            expert_s, expert_a,
+                            agent_s, agent_a,
+                            agent_ns, agent_d
+                        )
+                    else:
+                        # If not enough expert data, just update with agent replay
+                        agent.update_controller()
+
+                if not done:
+                    current_state = next_state
+                else:
+                    stats.trap[idx] = env.out_of_trap()
+                    stats.average_speed[idx] = totalspeed / episode_length
+                    stats.distance[idx] = totalspeed
+                    stats.crash_times[idx] = env.reach_end_crash()
+
+        # End of check_frequence episodes
+        print("goal_reached_times:", goal_reached_times)
+        intrinsic_thousand_reward_totall.append(goal_reached_times)
+        avg_extrinsic = check_extrinsic_reward / check_frequence
+        print("mean_extrinsic_reward:", avg_extrinsic)
+        extrinsic_thousand_reward_totall.append(avg_extrinsic)
+
+        # Save the best model if it improves
+        if avg_extrinsic >= max(extrinsic_thousand_reward_totall):
+            best_reward = avg_extrinsic
+            agent.save_model()
+            best_episode = i_thousand_episode
+
+        print(f"save best model in {best_episode}, best mean reward {best_reward}")
+
+    return agent, stats, intrinsic_thousand_reward_totall

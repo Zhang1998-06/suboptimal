@@ -3,3 +3,4 @@ numpy==1.24.3
 pandas==2.0.3
 pygame==2.5.2
 torch==2.4.0
+matplotlib==3.7.5
