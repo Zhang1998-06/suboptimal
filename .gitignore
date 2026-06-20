@@ -1,31 +1,31 @@
 __pycache__/
 *.py[cod]
-*.so
 
 .venv/
 venv/
 env/
-.env
-
-.DS_Store
 .idea/
 .vscode/
 .vs/
 
-# Generated experiment artifacts. Do not commit model checkpoints or results.
 *.pth
 *.pt
 *.ckpt
 *.pkl
 *.csv
 *.json
+*.log
 *.mp4
 *.png
 *.jpg
 *.jpeg
 *.gif
+*.ipynb
 
-scripts/continuous_results/
-scripts/discrete_ablation_results/
+tmp/
 videos/
 plots/
+results/
+*_results/
+continuous_results/
+discrete_ablation_results/

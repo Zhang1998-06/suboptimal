@@ -1,100 +1,80 @@
-# Suboptimal Bootstrap Training Code
+# Suboptimal Highway Training Code
 
-This repository contains training source code and run instructions only. It does
-not include evaluation scripts, checkpoints, CSV/JSON result files, plots,
-videos, notebooks, or generated caches.
+This repository contains source-only training code for the suboptimal highway
+experiments and baseline methods. It intentionally excludes evaluation scripts,
+checkpoints, CSV/JSON result files, plots, videos, notebooks, and cache files.
 
-## Contents
+## Included Models
 
-- `scripts/continuous_bootstrap.py`: trains the continuous Suboptimal Bootstrap model.
-- `scripts/continuous_vanilla_sac.py`: trains the continuous vanilla SAC backbone.
-- `scripts/continuous_dagger.py`: trains the continuous DAgger baseline.
-- `scripts/Dscontroller.py`: rule/controller used by Suboptimal Bootstrap and DAgger.
-- `scripts/highway_env/`: local environment package used by the training scripts.
-- `scripts/agents/hdqn_mdp.py`: discrete SAC-style model class used by the discrete backbone.
-- `scripts/dqnmodel.py`: vanilla discrete SAC-style model class.
+- `suboptimal_controller`: Suboptimal Bootstrap
+- `SACend`: vanilla discrete SAC backbone
+- `SAC_continuous`: continuous SAC variant
+- `sqil`: SQIL
+- `dapg`: DAPG
+- `ddqgfd`: DDPGfD
+- `dqfd`: DQfD
+- `TD3_BC`: TD3+BC
+- `CQL`: CQL
+- `AWAC`: AWAC
+- `IQL`: IQL
+- `BCQ`: BCQ
+- `GAIL`: GAIL
+- `BC`: behavior cloning
+- `IDMboostrap`, `IDM_MOBIL`, `warmSAC`: additional training variants used in
+  the ablation codebase
 
-## Environment
+Each model folder keeps its own copy of the environment and model source under
+`highway-env/scripts` because the baseline implementations were developed as
+separate experiment directories.
 
-The experiments were run with Python 3.8. A minimal setup is:
+## Setup
+
+Use Python 3.8 if possible.
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Run commands from `scripts/` so the local `highway_env` package is imported:
+For headless machines, set:
 
 ```bash
-cd scripts
 export MPLCONFIGDIR=/tmp/mplconfig
 ```
 
-## Train Continuous Suboptimal Bootstrap
+## Training
 
-This is the 5 Hz, 75 s horizon setting:
+Run commands from the target model's `highway-env/scripts` directory.
 
-```bash
-python continuous_bootstrap.py \
-  --duration 375 \
-  --offline-episodes 50 \
-  --bc-steps 6000 \
-  --train-episodes 2000 \
-  --log-interval 150 \
-  --seed 41 \
-  --model-path continuous_results/suboptimal_bootstrap_controller.pth \
-  --stats-path continuous_results/suboptimal_bootstrap_train_stats.csv \
-  --device cpu
-```
-
-## Train Continuous Vanilla SAC Backbone
-
-Matched backbone setting, without offline data, BC, KL/bootstrap terms, expert
-blend, reward KL penalty, or random warm-up:
+Suboptimal Bootstrap:
 
 ```bash
-python continuous_vanilla_sac.py \
-  --duration 375 \
-  --train-episodes 400 \
-  --seed 41 \
-  --random-steps 0 \
-  --log-interval 150 \
-  --checkpoint-selection final \
-  --model-path continuous_results/vanilla_sac_matched400_controller.pth \
-  --stats-path continuous_results/vanilla_sac_matched400_train_stats.csv \
-  --device cpu
+cd suboptimal_controller/highway-env/scripts
+python collect_trajectories.py
+python run_hdqn.py
 ```
 
-For a longer fixed-budget SAC run, change `--train-episodes` while keeping
-`--checkpoint-selection final` if SAC should not be selected by its own best
-checkpoint.
-
-## Train Continuous DAgger Baseline
+Vanilla SAC:
 
 ```bash
-python continuous_dagger.py \
-  --offline-episodes 50 \
-  --initial-bc-steps 6000 \
-  --dagger-iterations 6 \
-  --dagger-episodes 15 \
-  --dagger-bc-steps 2500 \
-  --seed 41 \
-  --device cpu
+cd SACend/highway-env/scripts
+python run_dqn.py
 ```
 
-## Artifacts
+Baseline methods:
 
-Training writes checkpoints and optional training statistics under ignored
-paths such as `scripts/continuous_results/`. These files are intentionally not
-part of the repository and should not be committed.
+```bash
+cd sqil/highway-env/scripts && python collect_trajectories.py && python run_hdqn.py
+cd dapg/highway-env/scripts && python collect_trajectories.py && python run_hdqn.py
+cd ddqgfd/highway-env/scripts && python collect_trajectories.py && python run_hdqn.py
+cd dqfd/highway-env/scripts && python collect_trajectories.py && python run_hdqn.py
+cd TD3_BC/highway-env/scripts && python collect_trajectories.py && python run_hdqn.py
+cd CQL/highway-env/scripts && python collect_trajectories.py && python run_hdqn.py
+cd AWAC/highway-env/scripts && python collect_trajectories.py && python run_hdqn.py
+cd IQL/highway-env/scripts && python collect_trajectories.py && python run_hdqn.py
+cd BCQ/highway-env/scripts && python collect_trajectories.py && python run_hdqn.py
+cd GAIL/highway-env/scripts && python collect_trajectories.py && python GAIL.py
+cd BC/highway-env/scripts && python collect_trajectories.py && python run_BC.py
+```
 
-## Notes
-
-- This PR is source-only. Reproduce checkpoints by running the training scripts.
-- CUDA is optional. Use `--device cpu` for portability if GPU drivers are not
-  configured.
-- The internal accepted Suboptimal checkpoint was selected after episode 300 and
-  before episode 450. If an exact matched-budget comparison is required, rerun
-  with episode-indexed checkpoint saving enabled and train the SAC backbone for
-  the same number of episodes.
+Training may write checkpoints, logs, or stats locally depending on the script.
+Those generated files are ignored by Git and should not be committed.
